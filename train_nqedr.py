@@ -7,7 +7,7 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import KFold
 from .data import circle, gaussian, breast_cancer
 from .file import save_training_nqedr_output
-from .circuit import nqedr_encoding, lipschitz_regularization, parameter_regularization, calculate_accuracy
+from .circuit import nqedr_encoding, calculate_accuracy
 from .data_types import NQEDRTrainingOutput
 import logging
 
@@ -18,14 +18,14 @@ n_layer = 3
 n_qubit = 3
 n_ensemble = 5
 learning_rate = 0.01
-n_epoch = 50
+n_epoch = 200
 early_stopping_patience = 15
 scaling_range = (0, 2 * np.pi)
 cv_folds = 5  # 5折交叉验证
 
-# 双正则化参数搜索范围
-lambda1_candidates = [0.0, 0.001, 0.01, 0.05, 0.1]  # 参数正则化
-lambda2_candidates = [0.0, 0.1, 0.2, 0.3, 0.5]  # 梯度正则化
+
+lambda1_candidates = [0.001, 0.01, 0.05, 0.1, 0.2]  # 参数正则化强度 λ1
+lambda2_candidates = [0.1, 0.2, 0.3, 0.5, 0.7]      # 梯度正则化强度 λ2
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -33,15 +33,39 @@ logger = logging.getLogger("NQE-DR-Trainer")
 
 
 def preprocess_data(x_train, x_validation):
-    """数据标准化处理"""
+    """数据标准化处理
     scaler = MinMaxScaler(feature_range=scaling_range)
     x_train_scaled = scaler.fit_transform(x_train)
     x_validation_scaled = scaler.transform(x_validation)
     return x_train_scaled, x_validation_scaled, scaler
 
 
+def parameter_regularization(theta):
+    """参数正则化 R1 = λ1 · ∥Θ∥²_F（Frobenius范数）"""
+    # Θ 包含所有可训练参数（权重和偏置）
+    return np.sum([np.sum(param**2) for param in theta])
+
+
+def gradient_regularization(weights, biases, x):
+    """梯度正则化 R2 = λ2 · ∥∇xNQE-DR(x)∥²（L2范数）"""
+    # 计算模型输出对输入的梯度
+    gradients = []
+    for i in range(x.shape[1]):
+        # 对每个输入特征求偏导
+        def partial_deriv(x_i):
+            x_perturbed = x.copy()
+            x_perturbed[i] = x_i
+            return nqedr_encoding(weights, biases, x_perturbed)
+        
+        # 使用数值微分计算梯度（量子模型通常无法直接求导）
+        grad = np.gradient(partial_deriv(x[i]))[0]
+        gradients.append(grad**2)
+    
+    return np.sum(gradients)
+
+
 def train_nqedr(lamb1, lamb2, weights, biases, x_train, y_train, x_validation, y_validation):
-    """NQE-DR编码方式的训练函数，带双正则化"""
+    """NQE-DR编码方式的训练函数，"""
     opt = AdamOptimizer(learning_rate)
     best_val_accuracy = 0
     best_weights = weights.copy()
@@ -52,27 +76,42 @@ def train_nqedr(lamb1, lamb2, weights, biases, x_train, y_train, x_validation, y
     cost_history = []
     train_acc_history = []
     val_acc_history = []
-    param_reg_history = []
-    lipschitz_history = []
+    param_reg_history = []  # R1 = λ1·∥Θ∥²_F
+    gradient_reg_history = []  # R2 = λ2·∥∇xNQE-DR∥²
+    lipschitz_bound_history = []  #  Lipschitz界 L = sup∥∇xNQE-DR∥
 
     for epoch in range(n_epoch):
-        # 带双正则化的成本函数
-        def cost(weights, biases):
-            # 基础损失
-            predictions = np.array([np.sign(nqedr_encoding(weights, biases, x)) for x in x_train])
-            loss = np.mean((predictions - y_train) ** 2)
+        # 定义完整损失函数 Ltotal = Ltask + R1 + R2
+        def total_loss(weights, biases):
+            # 1. 任务损失 Ltask（分类任务使用交叉熵损失）
+            predictions = np.array([nqedr_encoding(weights, biases, x) for x in x_train])
+            # 交叉熵损失（适用于分类任务）
+            epsilon = 1e-8  # 防止log(0)
+            y_probs = (predictions + 1) / 2  # 将[-1,1]转换为[0,1]概率
+            loss_task = -np.mean(y_train * np.log(y_probs + epsilon) + 
+                                (1 - y_train) * np.log(1 - y_probs + epsilon))
 
-            # 参数正则化 (λ1)
-            param_reg = parameter_regularization(weights, biases)
+            # 2. 参数正则化 R1 = λ1·∥Θ∥²_F
+            theta = [weights, biases]  # 所有可训练参数 Θ
+            r1 = lamb1 * parameter_regularization(theta)
 
-
-            lipschitz_reg = lipschitz_regularization(weights)
+            # 3. 梯度正则化 R2 = λ2·∥∇xNQE-DR∥²
+            # 对训练集样本的梯度正则化取平均
+            r2 = lamb2 * np.mean([gradient_regularization(weights, biases, x) for x in x_train])
 
             # 总损失
-            return loss + lamb1 * param_reg + lamb2 * lipschitz_reg, param_reg, lipschitz_reg
+            total = loss_task + r1 + r2
+            
+            # 计算Lipschitz界 L = sup∥∇xNQE-DR∥
+            gradients = [np.sqrt(gradient_regularization(weights, biases, x)) for x in x_train]
+            lipschitz_bound = np.max(gradients) if gradients else 0.0
+
+            return total, loss_task, r1, r2, lipschitz_bound
 
         # 优化步骤
-        (current_cost, param_reg, lipschitz_reg), _, _ = opt.step_and_cost(cost, weights, biases)
+        (current_loss, loss_task, r1, r2, lipschitz_bound), _, _ = opt.step_and_cost(
+            total_loss, weights, biases
+        )
 
         # 计算准确率
         train_predictions = np.array([np.sign(nqedr_encoding(weights, biases, x)) for x in x_train])
@@ -82,11 +121,12 @@ def train_nqedr(lamb1, lamb2, weights, biases, x_train, y_train, x_validation, y
         val_accuracy = calculate_accuracy(y_validation, val_predictions)
 
         # 记录历史
-        cost_history.append(current_cost)
+        cost_history.append(current_loss)
         train_acc_history.append(train_accuracy)
         val_acc_history.append(val_accuracy)
-        param_reg_history.append(param_reg)
-        lipschitz_history.append(lipschitz_reg)
+        param_reg_history.append(r1)  # 记录R1 = λ1·∥Θ∥²_F
+        gradient_reg_history.append(r2)  # 记录R2 = λ2·∥∇xNQE-DR∥²
+        lipschitz_bound_history.append(lipschitz_bound)  # 记录Lipschitz界
 
         # 早停机制
         if val_accuracy > best_val_accuracy:
@@ -100,14 +140,17 @@ def train_nqedr(lamb1, lamb2, weights, biases, x_train, y_train, x_validation, y
                 logger.info(f"Early stopping at epoch {epoch} (λ1={lamb1}, λ2={lamb2})")
                 break
 
-        # 打印进度
         if epoch % 10 == 0:
-            logger.info(f"Epoch {epoch}: Cost={current_cost:.4f}, Train Acc={train_accuracy:.4f}, "
-                        f"Val Acc={val_accuracy:.4f}, Param Reg={param_reg:.4f}, Lip Reg={lipschitz_reg:.4f}")
+            logger.info(
+                f"Epoch {epoch}: Ltotal={current_loss:.4f}, Ltask={loss_task:.4f}, "
+                f"R1={r1:.4f}, R2={r2:.4f}, L={lipschitz_bound:.4f}, "
+                f"Train Acc={train_accuracy:.4f}, Val Acc={val_accuracy:.4f}"
+            )
 
     return (best_val_accuracy, best_weights, best_biases, np.array(cost_history),
             np.array(train_acc_history), np.array(val_acc_history),
-            np.array(param_reg_history), np.array(lipschitz_history))
+            np.array(param_reg_history), np.array(gradient_reg_history),
+            np.array(lipschitz_bound_history))
 
 
 def select_best_regularizers(x, y):
@@ -125,7 +168,7 @@ def select_best_regularizers(x, y):
                 x_train, x_val = x[train_idx], x[val_idx]
                 y_train, y_val = y[train_idx], y[val_idx]
 
-                # 初始化参数
+                # 初始化参数 Θ（权重和偏置）
                 weights = np.random.normal(loc=0.0, scale=0.1,
                                            size=(n_layer, n_qubit, x_dim, x_dim),
                                            requires_grad=True)
@@ -133,8 +176,8 @@ def select_best_regularizers(x, y):
                                           size=(n_layer, n_qubit, x_dim),
                                           requires_grad=True)
 
-                # 训练模型（简化版）
-                val_acc, _, _, _, _, _, _, _ = train_nqedr(
+                # 训练模型
+                val_acc, _, _, _, _, _, _, _, _ = train_nqedr(
                     lamb1, lamb2, weights, biases, x_train, y_train, x_val, y_val
                 )
                 fold_scores.append(val_acc)
@@ -172,6 +215,10 @@ def run(dataset_name="circle"):
     else:
         raise ValueError(f"不支持的数据集: {dataset_name}")
 
+    # 确保标签为0/1（适应交叉熵损失）
+    y_train = (y_train + 1) / 2 if np.min(y_train) == -1 else y_train
+    y_val = (y_val + 1) / 2 if np.min(y_val) == -1 else y_val
+
     # 数据预处理
     x_train_scaled, x_val_scaled, scaler = preprocess_data(x_train, x_val)
     x_dim = x_train_scaled.shape[1]
@@ -179,7 +226,7 @@ def run(dataset_name="circle"):
     # 交叉验证选择最佳正则化参数
     best_lamb1, best_lamb2 = select_best_regularizers(x_train_scaled, y_train)
 
-    # 初始化集成模型参数
+    # 初始化集成模型参数 Θ
     weights = np.random.normal(loc=0.0, scale=0.1,
                                size=(n_ensemble, n_layer, n_qubit, x_dim, x_dim),
                                requires_grad=True)
@@ -205,13 +252,15 @@ def run(dataset_name="circle"):
     validation_accuracy_over_epochs = np.zeros((n_ensemble, max_epochs))
     weights_over_epochs = np.zeros((n_ensemble, n_layer, n_qubit, x_dim, x_dim))
     biases_over_epochs = np.zeros((n_ensemble, n_layer, n_qubit, x_dim))
-    param_reg_over_epochs = np.zeros((n_ensemble, max_epochs))
-    lipschitz_reg_over_epochs = np.zeros((n_ensemble, max_epochs))
+    param_reg_over_epochs = np.zeros((n_ensemble, max_epochs))  # R1历史
+    lipschitz_reg_over_epochs = np.zeros((n_ensemble, max_epochs))  # R2历史
+    lipschitz_bound_history = np.zeros((n_ensemble, max_epochs))  # Lipschitz界历史
     best_validation_accuracies = []
 
     for i in range(n_ensemble):
         (best_val_acc, best_weights, best_biases, cost_hist,
-         train_acc_hist, val_acc_hist, param_reg_hist, lipschitz_hist) = results[i]
+         train_acc_hist, val_acc_hist, param_reg_hist, grad_reg_hist,
+         lip_bound_hist) = results[i]
 
         best_validation_accuracies.append(best_val_acc)
         weights_over_epochs[i] = best_weights
@@ -221,8 +270,9 @@ def run(dataset_name="circle"):
         cost_over_epochs[i, :actual_epochs] = cost_hist
         train_accuracy_over_epochs[i, :actual_epochs] = train_acc_hist
         validation_accuracy_over_epochs[i, :actual_epochs] = val_acc_hist
-        param_reg_over_epochs[i, :actual_epochs] = param_reg_hist
-        lipschitz_reg_over_epochs[i, :actual_epochs] = lipschitz_hist
+        param_reg_over_epochs[i, :actual_epochs] = param_reg_hist  # 存储R1
+        lipschitz_reg_over_epochs[i, :actual_epochs] = grad_reg_hist  # 存储R2
+        lipschitz_bound_history[i, :actual_epochs] = lip_bound_hist  # 存储Lipschitz界
 
     # 保存结果
     output = NQEDRTrainingOutput(
@@ -235,8 +285,8 @@ def run(dataset_name="circle"):
         validation_accuracy_over_epochs=validation_accuracy_over_epochs,
         weights_over_epochs=weights_over_epochs,
         biases_over_epochs=biases_over_epochs,
-        param_regularization_over_epochs=param_reg_over_epochs,
-        lipschitz_regularization_over_epochs=lipschitz_reg_over_epochs
+        param_regularization_over_epochs=param_reg_over_epochs,  # R1 = λ1·∥Θ∥²_F
+        lipschitz_regularization_over_epochs=lipschitz_reg_over_epochs  # R2 = λ2·∥∇xNQE-DR∥²
     )
     save_training_nqedr_output(output)
 
@@ -244,9 +294,11 @@ def run(dataset_name="circle"):
     logger.info("\n===== 训练总结 =====")
     logger.info(f"平均验证准确率: {np.mean(best_validation_accuracies):.4f} ± {np.std(best_validation_accuracies):.4f}")
     logger.info(f"最佳正则化参数: λ1={best_lamb1}, λ2={best_lamb2}")
+    logger.info(f"最终Lipschitz界范围: [{np.min(lipschitz_bound_history):.4f}, {np.max(lipschitz_bound_history):.4f}]")
 
     return output
 
 
 if __name__ == "__main__":
     run(dataset_name="circle")
+    
