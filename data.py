@@ -4,20 +4,30 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.utils import shuffle
 from sklearn.decomposition import PCA
 
-def load_circle_dataset(random_state=42):
-    radius = np.sqrt(2 / np.pi)
-    X, y = make_circles(
-        n_samples=1000,
-        noise=0.1,
-        factor=0.7,
-        random_state=random_state
-    )
-    X = MinMaxScaler(feature_range=(-1, 1)).fit_transform(X)
-    y = 1 - y  # 圆内为1，圆外为0
-    return X, y
+def circle(samples, center=[0.0, 0.0], radius=np.sqrt(2 / np.pi)):
+    """
+
+    Args:
+        samples (int): number of samples to generate
+        center (tuple): center of the circle
+        radius (float: radius of the circle
+
+    Returns:
+        Xvals (array[tuple]): coordinates of points
+        yvals (array[int]): classification labels
+    """
+    Xvals, yvals = [], []
+    for i in range(samples):
+        x = 2 * (np.random.rand(2)) - 1
+        y = 0
+        if np.linalg.norm(x - center) < radius:
+            y = 1
+        Xvals.append(x)
+        yvals.append(y)
+    return np.array(Xvals, requires_grad=False), np.array(yvals, requires_grad=False)
 
 def load_gaussian_mixture_dataset(random_state=42):
-    """生成论文指定的高斯混合数据集"""
+    """生成高斯混合数据集"""
     X1, y1 = make_gaussian_quantiles(mean=[2]*10, cov=1.0,
                                     n_samples=333, n_features=10, random_state=random_state)
     X2, y2 = make_gaussian_quantiles(mean=[-2]*10, cov=1.0,
